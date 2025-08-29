@@ -2,6 +2,11 @@
 name = "xarxa-sdk-rs"
 version = "0.1.0"
 edition = "2024"
+authors = ["Xarxa Systems <contact@xarxa.io>"]
+repository = "https://github.com/xarxa-systems/xarxa-sdk-rs"
+description = "Xarxa Rust SDK"
+license = "MIT"
+readme = "README.md"
 
 [lib]
 crate-type = ["cdylib"]
