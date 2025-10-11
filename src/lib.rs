@@ -5,13 +5,21 @@ pub mod bindings;
 pub mod prelude {
     pub use crate::bindings::orchestrator::export;
     pub use crate::bindings::orchestrator::exports;
+    
+    pub use crate::bindings::orchestrator::xarxa::api::{
+        host_controller::send_result,
+        logger::logging,
+    }; 
 
     pub use crate::bindings::orchestrator::exports::xarxa::api::workflow_ctrl::Guest;
     pub use crate::bindings::orchestrator::xarxa::api::engine_types::{
         WorkflowRun, WorkflowError, RunId, Value, Kvpair, Code,
     };
 
-    pub use crate::pipeline::{PipelineState, Step, StepResult, WorkflowContext, steps};
+    pub use crate::pipeline::{
+        PipelineState, Pipeline, PipelinePlan, Step, StepResult, WorkflowContext,
+        WorkflowHistory, StepExecutionRecord, StepStatus, SerializableContext,
+    };
 }
 
 // #[macro_export]

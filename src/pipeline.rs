@@ -1,10 +1,8 @@
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
-use crate::{
-    bindings::orchestrator::xarxa::api::custom_http::http_request,
-    bindings::orchestrator::xarxa::api::http_types::{Header, Method},
-    bindings::orchestrator::xarxa::api::logger::logging,
-    bindings::orchestrator::xarxa::api::engine_types::{Kvpair, RunId, Value},
+use crate::bindings::orchestrator::xarxa::api::{
+    engine_types::{Kvpair, RunId, Value},
+    logger::logging,
 };
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -15,6 +13,89 @@ pub enum StepStatus {
     Failed(String),
     Compensating,
     Compensated,
+}
+
+/// Serializable representation of a Value
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum SerializableValue {
+    None,
+    Str(String),
+    Int64(i64),
+    Uint64(u64),
+    Float64(f64),
+    Boolean(bool),
+    Any(Vec<u8>),
+}
+
+impl SerializableValue {
+    pub fn from_value(value: &Value) -> Self {
+        match value {
+            Value::None => SerializableValue::None,
+            Value::Str(s) => SerializableValue::Str(s.clone()),
+            Value::Int64(i) => SerializableValue::Int64(*i),
+            Value::Uint64(u) => SerializableValue::Uint64(*u),
+            Value::Float64(f) => SerializableValue::Float64(*f),
+            Value::Boolean(b) => SerializableValue::Boolean(*b),
+            Value::Any(bytes) => SerializableValue::Any(bytes.clone()),
+        }
+    }
+
+    pub fn to_value(&self) -> Value {
+        match self {
+            SerializableValue::None => Value::None,
+            SerializableValue::Str(s) => Value::Str(s.clone()),
+            SerializableValue::Int64(i) => Value::Int64(*i),
+            SerializableValue::Uint64(u) => Value::Uint64(*u),
+            SerializableValue::Float64(f) => Value::Float64(*f),
+            SerializableValue::Boolean(b) => Value::Boolean(*b),
+            SerializableValue::Any(bytes) => Value::Any(bytes.clone()),
+        }
+    }
+}
+
+/// Serializable version of context for history
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SerializableContext {
+    pub data: HashMap<String, SerializableValue>,
+}
+
+impl SerializableContext {
+    pub fn from_context(ctx: &HashMap<String, Value>) -> Self {
+        let data = ctx.iter()
+            .map(|(k, v)| (k.clone(), SerializableValue::from_value(v)))
+            .collect();
+        SerializableContext { data }
+    }
+
+    pub fn to_context(&self) -> HashMap<String, Value> {
+        self.data.iter()
+            .map(|(k, v)| (k.clone(), v.to_value()))
+            .collect()
+    }
+}
+
+/// Captures the result of a single step execution in the history
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct StepExecutionRecord {
+    pub step_name: String,
+    pub status: StepStatus,
+    pub error: Option<String>,
+    /// Context state after this step completed (serialized)
+    pub context_snapshot: SerializableContext,
+}
+
+/// Complete execution history for replay
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct WorkflowHistory {
+    pub workflow_name: String,
+    pub original_input: Vec<u8>,
+    pub run_id: RunId,
+    /// Steps that have been executed in order
+    pub executed_steps: Vec<StepExecutionRecord>,
+    /// Current step index in the workflow
+    pub current_step: usize,
+    /// Final context state (serialized)
+    pub context: SerializableContext,
 }
 
 /// Workflow context that flows between steps
@@ -103,62 +184,12 @@ pub struct Step {
     pub action: Box<dyn Fn(&mut WorkflowContext) -> Result<StepResult, String> + Send + Sync>,
 }
 
-
-impl Step {
-    /// Create a new step with a context-aware action
-    pub fn new<F>(name: &str, action: F) -> Self
-    where
-        F: Fn(&mut WorkflowContext) -> Result<StepResult, String> + Send + Sync + 'static,
-    {
-        Step {
-            name: name.to_string(),
-            status: StepStatus::Pending,
-            retries_left: 0,
-            max_retries: 0,
-            compensation: None,
-            action: Box::new(action),
-        }
-    }
-
-    /// Create a simple step that just continues to the next step
-    pub fn simple<F>(name: &str, action: F) -> Self
-    where
-        F: Fn(&mut WorkflowContext) -> Result<(), String> + Send + Sync + 'static,
-    {
-        Step::new(name, move |ctx| {
-            action(ctx)?;
-            
-            Ok(StepResult::Continue)
-        })
-    }
-
-    /// Create a step that doesn't need context (legacy compatibility)
-    pub fn basic<F>(name: &str, action: F) -> Self
-    where
-        F: Fn() -> Result<(), String> + Send + Sync + 'static,
-    {
-        Step::simple(name, move |_ctx| action())
-    }
-
-    pub fn retry(mut self, n: u32) -> Self {
-        self.max_retries = n;
-        self.retries_left = n;
-        self
-    }
-
-    pub fn compensate<F>(mut self, f: F) -> Self
-    where
-        F: Fn(&mut WorkflowContext) -> Result<(), String> + Send + Sync + 'static,
-    {
-        self.compensation = Some(Box::new(f));
-        self
-    }
-}
-
 pub struct PipelineState {
     pub steps: Vec<Step>,
     pub current: usize,
     pub context: WorkflowContext,
+    /// Track execution history for replay
+    pub execution_history: Vec<StepExecutionRecord>,
 }
 
 impl PipelineState {
@@ -167,6 +198,7 @@ impl PipelineState {
             steps,
             current: 0,
             context: WorkflowContext::new(),
+            execution_history: Vec::new(),
         }
     }
 
@@ -192,19 +224,31 @@ impl PipelineState {
             return;
         }
 
-        let step = &mut self.steps[self.current];
+        let current_step_idx = self.current;
 
-        match step.status {
+        // Check the step status first
+        let step_status = self.steps[current_step_idx].status.clone();
+
+        match step_status {
             StepStatus::Pending => {
-                step.status = StepStatus::Running;
+                self.steps[current_step_idx].status = StepStatus::Running;
 
                 let message = "Pending -> Running".to_string();
-                logging( &message.into_bytes());
+                logging(&message.into_bytes());
             }
             StepStatus::Running => {
-                match (step.action)(&mut self.context) {
+                // Execute the action - need to extract it to avoid borrow conflicts
+                let action_result = {
+                    let step = &self.steps[current_step_idx];
+                    (step.action)(&mut self.context)
+                };
+
+                match action_result {
                     Ok(result) => {
-                        step.status = StepStatus::Completed;
+                        self.steps[current_step_idx].status = StepStatus::Completed;
+
+                        // Record the successful execution
+                        self.record_step_execution(current_step_idx);
 
                         // Handle the step result
                         match result {
@@ -224,25 +268,47 @@ impl PipelineState {
                             }
                             StepResult::Wait(_reason) => {
                                 // Stay on current step, will be resumed by external event
-                                step.status = StepStatus::Pending;
+                                self.steps[current_step_idx].status = StepStatus::Pending;
                             }
                         }
                     }
                     Err(e) => {
-                        if step.retries_left > 0 {
-                            step.retries_left -= 1;
-                            step.status = StepStatus::Pending;
+                        let retries_left = self.steps[current_step_idx].retries_left;
+
+                        if retries_left > 0 {
+                            self.steps[current_step_idx].retries_left -= 1;
+                            self.steps[current_step_idx].status = StepStatus::Pending;
                         } else {
-                            step.status = StepStatus::Failed(e.clone());
-                            if let Some(comp) = &step.compensation {
-                                step.status = StepStatus::Compensating;
-                                match comp(&mut self.context) {
+                            self.steps[current_step_idx].status = StepStatus::Failed(e.clone());
+
+                            // Record the failed execution
+                            self.record_step_execution(current_step_idx);
+
+                            // Check if there's a compensation function
+                            let has_compensation = self.steps[current_step_idx].compensation.is_some();
+
+                            if has_compensation {
+                                self.steps[current_step_idx].status = StepStatus::Compensating;
+
+                                // Execute compensation
+                                let comp_result = {
+                                    let step = &self.steps[current_step_idx];
+                                    if let Some(comp) = &step.compensation {
+                                        comp(&mut self.context)
+                                    } else {
+                                        Ok(())
+                                    }
+                                };
+
+                                match comp_result {
                                     Ok(_) => {
-                                        step.status = StepStatus::Compensated;
+                                        self.steps[current_step_idx].status = StepStatus::Compensated;
+                                        self.record_step_execution(current_step_idx);
                                         self.current += 1;
                                     }
                                     Err(_err) => {
                                         // Compensation failed, workflow is stuck
+                                        self.record_step_execution(current_step_idx);
                                     }
                                 }
                             } else {
@@ -263,185 +329,159 @@ impl PipelineState {
     pub fn is_finished(&self) -> bool {
         self.current >= self.steps.len()
     }
+
+    /// Replay workflow from history without executing actions
+    /// This reconstructs the context and step states from previous executions
+    pub fn replay_from_history(&mut self, history: &WorkflowHistory) {
+        // Restore the context from history
+        self.context.data = history.context.to_context();
+        self.context.run_id = Some(history.run_id);
+
+        // Set the current step position
+        self.current = history.current_step;
+
+        // Replay each executed step to restore state
+        for (idx, record) in history.executed_steps.iter().enumerate() {
+            if idx < self.steps.len() {
+                self.steps[idx].status = record.status.clone();
+
+                // Log the replay
+                let msg = format!(
+                    "Replaying step '{}' with status: {:?}",
+                    record.step_name, record.status
+                );
+                logging(msg.as_bytes());
+            }
+        }
+
+        // Copy the execution history
+        self.execution_history = history.executed_steps.clone();
+
+        let msg = format!(
+            "Replayed {} steps, continuing from step {}",
+            history.executed_steps.len(),
+            self.current
+        );
+        logging(msg.as_bytes());
+    }
+
+    /// Capture current execution state as history
+    pub fn capture_history(&self, workflow_name: String, original_input: Vec<u8>) -> WorkflowHistory {
+        WorkflowHistory {
+            workflow_name,
+            original_input,
+            run_id: self.context.run_id.unwrap_or(0),
+            executed_steps: self.execution_history.clone(),
+            current_step: self.current,
+            context: SerializableContext::from_context(&self.context.data),
+        }
+    }
+
+    /// Record a step execution in history
+    fn record_step_execution(&mut self, step_index: usize) {
+        if step_index < self.steps.len() {
+            let step = &self.steps[step_index];
+            let record = StepExecutionRecord {
+                step_name: step.name.clone(),
+                status: step.status.clone(),
+                error: match &step.status {
+                    StepStatus::Failed(e) => Some(e.clone()),
+                    _ => None,
+                },
+                context_snapshot: SerializableContext::from_context(&self.context.data),
+            };
+
+            // Update or append the record
+            if step_index < self.execution_history.len() {
+                self.execution_history[step_index] = record;
+            } else {
+                self.execution_history.push(record);
+            }
+        }
+    }
 }
 
-/// Helper functions for creating common step types
-pub mod steps {
-    use super::*;
+/// Builder for creating pipelines with a fluent API and saga pattern support
+pub struct Pipeline {
+    steps: Vec<StepBuilder>,
+}
 
-    /// Make an HTTP request and store the response
-    pub fn http_get(name: &str, url_key: &str, response_key: &str) -> Step {
-        let url_key = url_key.to_string();
-        let response_key = response_key.to_string();
-        Step::new(name, move |ctx| {
-            let url = ctx.get_string(&url_key)
-                .ok_or_else(|| format!("Missing URL in context key: {}", url_key))?;
+struct StepBuilder {
+    name: String,
+    action: Box<dyn Fn(&mut WorkflowContext) -> Result<(), String> + Send + Sync>,
+    compensation: Option<Box<dyn Fn(&mut WorkflowContext) -> Result<(), String> + Send + Sync>>,
+    max_retries: u32,
+}
 
-            match http_request(&[], Method::Get, &url, &[]) {
-                Ok(response) => {
-                    ctx.set(&response_key, Value::Any(response));
-                    Ok(StepResult::Continue)
-                }
-                Err(e) => Err(format!("HTTP request failed: {}", e))
-            }
-        })
+impl Pipeline {
+    /// Create a new empty pipeline
+    pub fn new() -> Self {
+        Pipeline { steps: Vec::new() }
     }
 
-    /// Make an HTTP POST request with data from context
-    pub fn http_post(name: &str, url_key: &str, data_key: &str, response_key: &str) -> Step {
-        let url_key = url_key.to_string();
-        let data_key = data_key.to_string();
-        let response_key = response_key.to_string();
-        Step::new(name, move |ctx| {
-            let url = ctx.get_string(&url_key)
-                .ok_or_else(|| format!("Missing URL in context key: {}", url_key))?;
-            let data = ctx.get_bytes(&data_key)
-                .ok_or_else(|| format!("Missing data in context key: {}", data_key))?;
-
-            match http_request(&[], Method::Post, &url, data) {
-                Ok(response) => {
-                    ctx.set(&response_key, Value::Any(response));
-                    Ok(StepResult::Continue)
-                }
-                Err(e) => Err(format!("HTTP POST failed: {}", e))
-            }
-        })
-    }
-
-    /// Transform data in the context
-    pub fn transform<F>(name: &str, f: F) -> Step
+    /// Add a step with an action that receives context
+    /// Use `|_ctx|` if you don't need the context
+    pub fn step<F>(mut self, name: &str, action: F) -> Self
     where
         F: Fn(&mut WorkflowContext) -> Result<(), String> + Send + Sync + 'static,
     {
-        Step::simple(name, move |ctx| f(ctx))
+        let step = StepBuilder {
+            name: name.to_string(),
+            action: Box::new(action),
+            compensation: None,
+            max_retries: 0,
+        };
+        self.steps.push(step);
+        self
     }
 
-    /// Conditional step that can skip or jump based on context data
-    pub fn condition<F>(name: &str, f: F) -> Step
+    /// Add a compensation action for a specific step by name
+    /// Use `|_ctx|` if you don't need the context
+    pub fn compensate<F>(mut self, step_name: &str, compensation: F) -> Self
     where
-        F: Fn(&mut WorkflowContext) -> Result<StepResult, String> + Send + Sync + 'static,
+        F: Fn(&mut WorkflowContext) -> Result<(), String> + Send + Sync + 'static,
     {
-        Step::new(name, move |ctx| f(ctx))
+        if let Some(step) = self.steps.iter_mut().find(|s| s.name == step_name) {
+            step.compensation = Some(Box::new(compensation));
+        }
+        self
     }
 
-    /// Log a message with data from context
-    pub fn log(name: &str, message_template: &str) -> Step {
-        let template = message_template.to_string();
+    /// Set the retry count for the last added step
+    pub fn retry(mut self, count: u32) -> Self {
+        if let Some(last_step) = self.steps.last_mut() {
+            last_step.max_retries = count;
+        }
+        self
+    }
 
-        Step::simple(name, move |ctx| {
-            // Simple template replacement - replace {key} with context values
-            let mut message = template.clone();
-
-            for (key, value) in &ctx.data {
-                let placeholder = format!("{{{}}}", key);
-                let value_str = match value {
-                    Value::Str(s) => s.clone(),
-                    Value::Int64(i) => i.to_string(),
-                    Value::Float64(f) => f.to_string(),
-                    Value::Boolean(b) => b.to_string(),
-                    Value::Uint64(u) => u.to_string(),
-                    Value::None => "none".to_string(),
-                    Value::Any(_) => "[binary data]".to_string(),
-                };
-                message = message.replace(&placeholder, &value_str);
+    /// Build the pipeline into a PipelineState
+    pub fn build(self) -> PipelineState {
+        let steps: Vec<Step> = self.steps.into_iter().map(|sb| {
+            let action = sb.action;
+            
+            Step {
+                name: sb.name,
+                status: StepStatus::Pending,
+                retries_left: sb.max_retries,
+                max_retries: sb.max_retries,
+                compensation: sb.compensation,
+                action: Box::new(move |ctx| {
+                    action(ctx)?;
+                    Ok(StepResult::Continue)
+                }),
             }
+        }).collect();
 
-            // Send log to host if we have a run_id
-            if let Some(run_id) = ctx.run_id {
-                let log_msg = format!("{message}, run_id: {run_id}");
-
-                logging(&log_msg.into_bytes());
-            }
-
-            Ok(())
-        })
-    }
-
-    pub fn log_to_host(name: &str, message: &str) -> Step {
-        let msg = message.to_string();
-
-        Step::simple(name, move |_ctx| {
-            logging(&msg.clone().into_bytes());
-
-            Ok(())
-        })
-    }
-
-    /// Set a value in the context
-    pub fn set_value(name: &str, key: &str, value: Value) -> Step {
-        let key = key.to_string();
-        Step::simple(name, move |ctx| {
-            ctx.set(&key, value.clone());
-            Ok(())
-        })
-    }
-
-    /// Calculate and store a numeric result
-    pub fn calculate<F>(name: &str, result_key: &str, f: F) -> Step
-    where
-        F: Fn(&mut WorkflowContext) -> Result<f64, String> + Send + Sync + 'static,
-    {
-        let result_key = result_key.to_string();
-        Step::simple(name, move |ctx| {
-            let result = f(ctx)?;
-            ctx.set(&result_key, Value::Float64(result));
-            Ok(())
-        })
+        PipelineState::new(steps)
     }
 }
 
-// pub type Step = (String, Box<dyn Fn() -> Result<(), String> + 'static>);
+impl Default for Pipeline {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-// pub struct Pipeline {
-//     pub(crate) steps: Vec<Step>,
-// }
-
-// impl Pipeline {
-//     pub fn new() -> Self {
-//         Pipeline { steps: vec![] }
-//     }
-
-//     pub fn step<F>(mut self, name: &str, f: F) -> Self
-//     where
-//         F: Fn() -> Result<(), String> + 'static,
-//     {
-//         self.steps.push((name.to_string(), Box::new(f)));
-//         self
-//     }
-
-// }
-
-// pub trait Pipeline<F> {
-//     fn step(&mut self, name: &str, f: F) -> Self;
-// }
-
-// enum StepType {
-//     Action(String),
-// }
-
-// impl Pipeline for Engine {
-//     // pub fn new() -> Engine {
-//     //     Engine {
-//     //         steps: Vec::new(),
-//     //         id: todo!(),
-//     //     }
-//     // }
-
-//     fn step<F>(&mut self, name: &str, f: F) -> Self
-//     where
-//         F: Fn() -> Result<(), String> + 'static,
-//     {
-//         self.steps.push((name.to_string(), Box::new(f)));
-//         self
-//     }
-
-//     // fn run(self) -> Result<(), String> {
-//     //     for (name, step) in self.steps {
-//     //         println!("Executing step: {name}");
-            
-//     //         step()?;
-//     //     }
-
-//     //     Ok(())
-//     // }
-// }
+/// Alias for the result of a pipeline builder function
+pub type PipelinePlan = Pipeline;

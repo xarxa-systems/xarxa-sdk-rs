@@ -1,171 +1,122 @@
-// use xarxa_sdk_rs::pipeline::{
-//     PipelineState, Step, StepResult, WorkflowContext, steps,
-// };
-// use xarxa_sdk_rs::{
-//     bindings::orchestrator::export,
-//     exports,
-//     Value,
-//     exports::xarxa::api::workflow_ctrl,
-//     Code,
-// };
-// use xarxa_sdk_rs::bindings::orchestrator::exports::xarxa::api::workflow_ctrl;
-
-
-
-
 use xarxa_sdk_rs::prelude::*;
 use xarxa_sdk_rs::prelude::exports;
 
-
-/// A realistic workflow that processes user data through multiple steps
-fn data_processing_workflow() -> PipelineState {
-    PipelineState::new(vec![
-        // Step 0
-        steps::log_to_host("start_log", "Starting workflow"),
-
-        // Step 1: Set up initial data
-        steps::set_value("setup", "api_url", Value::Str("https://jsonplaceholder.typicode.com/users/1".to_string())),
-
-        // Step 2: Log what we're about to do
-        steps::log("start_log", "Starting workflow: fetching user data from {api_url}"),
-
-        // Step 3: Make HTTP request to fetch user data
-        steps::http_get("fetch_user", "api_url", "user_response"),
-
-        // Step 4: Parse and transform the response
-        steps::transform("parse_user", |ctx| {
-            let response = ctx.get_bytes("user_response")
-                .ok_or("No user response found")?;
-
-            // Simulate parsing JSON (in real use you'd use serde_json)
-            let response_str = String::from_utf8(response.clone())
-                .map_err(|_| "Invalid UTF-8 in response")?;
-
-            // Extract some basic info (mock parsing)
-            let user_id = if response_str.contains("\"id\":") {
-                1234 // Mock extracted ID
-            } else {
-                0
-            };
-
-            ctx.set("user_id", Value::Int64(user_id));
-            ctx.set("raw_response", Value::Str(response_str));
-
-            Ok(())
-        }),
-
-        // Step 5: Conditional logic based on user data
-        steps::condition("check_user", |ctx| {
-            let user_id = ctx.get_i64("user_id").unwrap_or(0);
-
-            if user_id > 0 {
-                Ok(StepResult::Continue) // Proceed to success path
-            } else {
-                Ok(StepResult::JumpTo("error_handler".to_string())) // Jump to error handling
-            }
-        }),
-
-        // Step 6: Calculate some metrics
-        steps::calculate("calculate_metrics", "score", |ctx| {
-            let user_id = ctx.get_i64("user_id").unwrap_or(0) as f64;
-            let score = user_id * 1.5 + 42.0; // Some arbitrary calculation
-            Ok(score)
-        }),
-
-        // Step 7: Log success
-        steps::log("success_log", "User {user_id} processed successfully with score {score}"),
-
-        // Step 8: Skip error handler
-        Step::new("skip_error", |_ctx| Ok(StepResult::Skip(1))),
-
-        // Step 9: Error handler (will be skipped if everything goes well)
-        Step::new("error_handler", |ctx| {
-            ctx.set("error_message", Value::Str("Failed to process user data".to_string()));
-            Ok(StepResult::Continue)
-        }).retry(3), // Retry up to 3 times
-
-        // Step 10: Final logging
-        steps::log("final_log", "Workflow completed. Final status: {error_message}"),
-    ])
+// Example: Booking saga with compensations
+struct Booking {
+    flight_id: String,
+    user_id: String,
+    amount: f64,
 }
 
-/// Another example: E-commerce order processing workflow
-fn order_processing_workflow() -> PipelineState {
-    PipelineState::new(vec![
-        // Initialize order data
-        steps::transform("init_order", |ctx| {
-            ctx.set("order_id", Value::Str("ORD-12345".to_string()));
-            ctx.set("customer_id", Value::Int64(67890));
-            ctx.set("total_amount", Value::Float64(99.99));
-            Ok(())
-        }),
+fn reserve_flight(flight_id: &str) -> Result<(), String> {
+    // Simulate flight reservation
+    let msg = format!("run reserve flight with flight_id: {flight_id}");
+    logging(msg.as_bytes());
 
-        // Validate order
-        steps::condition("validate_order", |ctx| {
-            let amount = ctx.get_f64("total_amount").unwrap_or(0.0);
-            if amount > 0.0 {
-                ctx.set("status", Value::Str("validated".to_string()));
-                Ok(StepResult::Continue)
-            } else {
-                Ok(StepResult::JumpTo("cancel_order".to_string()))
-            }
-        }),
-
-        // Check inventory (simulate HTTP call to inventory service)
-        steps::transform("check_inventory", |ctx| {
-            // Mock inventory check - in real workflow this would be an HTTP request
-            let available = true; // Simulate inventory check result
-            ctx.set("inventory_available", Value::Boolean(available));
-
-            if !available {
-                return Err("Item out of stock".to_string());
-            }
-            Ok(())
-        }).retry(2), // Retry inventory checks
-
-        // Process payment
-        steps::transform("process_payment", |ctx| {
-            let amount = ctx.get_f64("total_amount").unwrap_or(0.0);
-            // Simulate payment processing
-            ctx.set("payment_id", Value::Str(format!("PAY-{}", (amount * 100.0) as u64)));
-            ctx.set("payment_status", Value::Str("success".to_string()));
-            Ok(())
-        }),
-
-        // Ship order
-        steps::transform("ship_order", |ctx| {
-            let order_id = ctx.get_string("order_id").unwrap_or_default();
-            ctx.set("tracking_number", Value::Str(format!("TRK-{}-001", order_id)));
-            ctx.set("status", Value::Str("shipped".to_string()));
-            Ok(())
-        }),
-
-        // Send confirmation
-        steps::log("send_confirmation", "Order {order_id} shipped! Tracking: {tracking_number}"),
-
-        // Skip cancellation step
-        Step::new("skip_cancel", |_ctx| Ok(StepResult::Skip(1))),
-
-        // Cancellation handler
-        Step::new("cancel_order", |ctx| {
-            ctx.set("status", Value::Str("cancelled".to_string()));
-            Ok(StepResult::Continue)
-        }),
-
-        // Final status
-        steps::log("final_status", "Order processing complete. Status: {status}"),
-    ])
+    Ok(())
 }
 
+fn release_flight(_flight_id: &str) -> Result<(), String> {
+    // Simulate flight release
+    Ok(())
+}
+
+fn charge_card(_user_id: &str, _amount: f64) -> Result<(), String> {
+    // Simulate card charge
+    Ok(())
+}
+
+fn refund(_user_id: &str, _amount: f64) -> Result<(), String> {
+    // Simulate refund
+    Ok(())
+}
+
+fn send_email(_user_id: &str) -> Result<(), String> {
+    // Simulate email sending
+    Ok(())
+}
+
+fn send_sms(_user_id: &str) -> Result<(), String> {
+    // Simulate SMS sending
+    Ok(())
+}
+
+/// Example booking flow with saga pattern
+fn booking_flow(b: Booking) -> PipelineState {
+    // Clone the data we need for each closure
+    let flight_id = b.flight_id.clone();
+    let flight_id_comp = b.flight_id.clone();
+    let user_id = b.user_id.clone();
+    let user_id_comp = b.user_id.clone();
+    let user_id_email = b.user_id.clone();
+    let user_id_sms = b.user_id.clone();
+    let amount = b.amount;
+
+    Pipeline::new()
+        .step("reserve", move |_ctx| reserve_flight(&flight_id))
+        .compensate("reserve", move |_ctx| release_flight(&flight_id_comp))
+        .step("charge", move |_ctx| charge_card(&user_id, amount))
+        .compensate("charge", move |_ctx| refund(&user_id_comp, amount))
+        .step("email_notify", move |_ctx| send_email(&user_id_email))
+        .step("sms_notification", move |_ctx| send_sms(&user_id_sms))
+        .build()
+}
+
+/// Example with context usage for data sharing between steps
+fn payment_flow_with_context() -> PipelineState {
+    Pipeline::new()
+        .step("validate", |ctx| {
+            // Validate and store in context
+            ctx.set("payment_id", Value::Str("PAY-123".to_string()));
+            ctx.set("amount", Value::Float64(99.99));
+            Ok(())
+        })
+        .step("process", |ctx| {
+            // Read from context
+            let _payment_id = ctx.get_string("payment_id")
+                .ok_or("Missing payment_id")?;
+            let _amount = ctx.get_f64("amount")
+                .ok_or("Missing amount")?;
+
+            // Process payment
+            ctx.set("status", Value::Str("processed".to_string()));
+            Ok(())
+        })
+        .compensate("process", |ctx| {
+            // Compensate using context data
+            let _payment_id = ctx.get_string("payment_id").unwrap();
+            // Refund logic here
+            Ok(())
+        })
+        .step("notify", |ctx| {
+            let _status = ctx.get_string("status").unwrap_or_default();
+            // Send notification
+            Ok(())
+        })
+        .build()
+}
 
 struct Engine;
 
 impl Guest for Engine {
     fn start_workflow(workflow_name: String, input: Vec<u8>) -> Result<WorkflowRun, WorkflowError> {
+        let msg = format!("Starting workflow: {}", workflow_name);
+        logging(msg.as_bytes());
+
+        // Store the original input for history
+        let original_input = input.clone();
+
         // Create the appropriate workflow based on the name
         let mut pipeline = match workflow_name.as_str() {
-            "data_processing" => data_processing_workflow(),
-            "order_processing" => order_processing_workflow(),
+            "booking" => {
+                let booking = Booking {
+                    flight_id: "FL-123".to_string(),
+                    user_id: "user-456".to_string(),
+                    amount: 299.99,
+                };
+                booking_flow(booking)
+            },
+            "payment" => payment_flow_with_context(),
             _ => {
                 return Err(WorkflowError {
                     err: format!("Unknown workflow: {}", workflow_name),
@@ -174,8 +125,7 @@ impl Guest for Engine {
             }
         };
 
-        // Parse input data (assuming it's JSON or some serialized format)
-        // For this example, we'll just use the raw bytes
+        // Parse input data and add to context
         if !input.is_empty() {
             // You could parse JSON here, for example:
             // let input_data: serde_json::Value = serde_json::from_slice(&input)?;
@@ -186,32 +136,105 @@ impl Guest for Engine {
         let run_id = 12345u64; // In real implementation, this would be generated
         pipeline.context = pipeline.context.with_run_id(run_id);
 
-        // Execute the first tick to get started
+        // Execute the first tick to start the workflow
         pipeline.tick();
 
-        // Note: In a real implementation, you'd serialize the pipeline state
-        // For this example, we'll skip serialization due to function pointer complexity
+        // Capture the current state as history
+        let history = pipeline.capture_history(workflow_name.clone(), original_input);
 
-        // Create the workflow run result
+        // Serialize the history to return to the host
+        let history_bytes = serde_json::to_vec(&history)
+            .map_err(|e| WorkflowError {
+                err: format!("Failed to serialize history: {}", e),
+                code: Code::EmptyInput,
+            })?;
+
+        let msg = format!(
+            "Workflow started, executed {} steps",
+            history.executed_steps.len()
+        );
+        logging(msg.as_bytes());
+
+        // Package the history bytes as Kvpair to return to the host
+        let history_kvpair = vec![Kvpair {
+            key: "workflow_history".to_string(),
+            value: Value::Any(history_bytes),
+        }];
+
+        // Return the workflow run with serialized history
         Ok(WorkflowRun {
             id: run_id,
-            input: vec![], // Could include processed input here
+            input: history_kvpair, // Return the history as Kvpair
             timestamp: 1640995200, // Unix timestamp - in real impl, use current time
         })
     }
 
-    fn continue_workflow(id: RunId, _state: Vec<u8>) -> Result<Vec<u8>, WorkflowError> {
-        // In a real implementation, you'd deserialize the pipeline state from `state`
-        // For this example, we'll create a new pipeline to demonstrate the concept
+    fn continue_workflow(id: RunId, state: Vec<u8>) -> Result<Vec<u8>, WorkflowError> {
+        let msg = format!("Continuing workflow with run_id: {}", id);
+        logging(msg.as_bytes());
 
-        let mut pipeline = data_processing_workflow()
-            .with_context(WorkflowContext::new().with_run_id(id));
+        // Deserialize the history from the state
+        let history: WorkflowHistory = serde_json::from_slice(&state)
+            .map_err(|e| WorkflowError {
+                err: format!("Failed to deserialize history: {}", e),
+                code: Code::EmptyInput,
+            })?;
 
-        // Execute one tick of the workflow
+        let msg = format!(
+            "Loaded history for workflow '{}' with {} executed steps",
+            history.workflow_name,
+            history.executed_steps.len()
+        );
+        logging(msg.as_bytes());
+
+        // Recreate the workflow based on the workflow name
+        let mut pipeline = match history.workflow_name.as_str() {
+            "booking" => {
+                let booking = Booking {
+                    flight_id: "FL-123".to_string(),
+                    user_id: "user-456".to_string(),
+                    amount: 299.99,
+                };
+                booking_flow(booking)
+            },
+            "payment" => payment_flow_with_context(),
+            _ => {
+                return Err(WorkflowError {
+                    err: format!("Unknown workflow: {}", history.workflow_name),
+                    code: Code::NotFound,
+                });
+            }
+        };
+
+        // Replay the workflow from history
+        // This restores the context and step states without re-executing actions
+        pipeline.replay_from_history(&history);
+
+        // Execute the next tick to continue from where we left off
         pipeline.tick();
 
-        // Return empty state for now (in real impl, serialize the updated pipeline)
-        Ok(vec![])
+        // Capture the updated history
+        let updated_history = pipeline.capture_history(
+            history.workflow_name.clone(),
+            history.original_input.clone(),
+        );
+
+        // Serialize the updated history
+        let history_bytes = serde_json::to_vec(&updated_history)
+            .map_err(|e| WorkflowError {
+                err: format!("Failed to serialize updated history: {}", e),
+                code: Code::EmptyInput,
+            })?;
+
+        let msg = format!(
+            "Workflow continued, now at step {} with {} total executed steps",
+            updated_history.current_step,
+            updated_history.executed_steps.len()
+        );
+        logging(msg.as_bytes());
+
+        // Return the updated history
+        Ok(history_bytes)
     }
 }
 
