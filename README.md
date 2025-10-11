@@ -44,3 +44,21 @@ If someone else updated the submodule reference:
 git pull
 git submodule update --init --recursive
 ```
+
+### Update wit contract
+```bash
+git add .
+git commit -m "new version"
+git push origin main
+
+git tag -a v1.2.0 -m "new version"
+git push origin --tags
+```
+
+### Generate bindings
+```bash
+wit-bindgen rust \                                              
+  --out-dir src/bindings \
+  --world orchestrator \
+  wit/orchestrator
+```
